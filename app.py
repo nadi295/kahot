@@ -109,39 +109,41 @@ QUIZ_DATA = {
 }
 
 MODES = list(QUIZ_DATA.keys())
-
-GAME_MODES = ['Classic', 'Steal']
+GAME_MODES = ['Classic', 'Steal', 'Team']
 TIMER_OPTIONS = [15, 30, 60]
+MAX_PLAYERS = 6
+TEAM_NAMES = ['Tim Alpha', 'Tim Bravo']
+TEAM_COLORS = {'A': '#2980b9', 'B': '#e67e22'}
 
 # ─── Room State ───────────────────────────────────────────────────────────────
 
 rooms = {}
-# rooms[code] = {
-#   players: {sid: {name, score, answered, answer, id, card_picked, card_idx, question_idx}},
-#   host: sid,
-#   mode: str,          # quiz category
-#   game_mode: str,     # 'Classic' or 'Steal'
-#   timer_duration: int,# seconds per question
-#   questions: [...],
-#   current_q: int,
-#   state: 'lobby'|'question'|'card_pick'|'result'|'finished',
-#   timer_greenlet: greenlet or None,
-#   q_start_time: float,
-#   chat: [{name, msg, ts}],
-# }
-
-player_sessions = {}  # player_id -> {room_code, sid}
+player_sessions = {}
 
 
 def gen_code():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=5))
 
 
-def room_summary(code, room, for_sid=None):
+def new_player(name, player_id, team=None):
+    return {
+        'name': name, 'score': 0, 'answered': False,
+        'answer': None, 'id': player_id, 'team': team,
+        'card_picked': False, 'card_idx': None,
+        'card_effect': None, 'card_value': 0,
+        'card_label': '', 'card_icon': '',
+        'q_index': 0, 'my_correct_idx': None,
+        'my_questions': None, 'finished': False,
+        'timer_greenlet': None,
+    }
+
+
+def room_summary(code, room):
     players = room['players']
     p_list = [
         {'name': v['name'], 'score': v['score'], 'id': v['id'],
-         'is_host': k == room['host'], 'sid': k}
+         'team': v.get('team'), 'is_host': k == room['host'], 'sid': k,
+         'finished': v.get('finished', False)}
         for k, v in players.items()
     ]
     return {
@@ -152,10 +154,23 @@ def room_summary(code, room, for_sid=None):
         'state': room['state'],
         'current_q': room['current_q'],
         'total_q': len(room['questions']),
+        'max_players': MAX_PLAYERS,
     }
 
 
-def cancel_timer(room):
+def broadcast_scoreboard(code):
+    room = rooms.get(code)
+    if not room:
+        return
+    p_list = [
+        {'name': v['name'], 'score': v['score'], 'id': v['id'],
+         'team': v.get('team'), 'finished': v.get('finished', False)}
+        for v in room['players'].values()
+    ]
+    socketio.emit('score_update', {'players': p_list}, room=code)
+
+
+def cancel_room_timer(room):
     if room.get('timer_greenlet'):
         try:
             room['timer_greenlet'].kill()
@@ -164,30 +179,21 @@ def cancel_timer(room):
         room['timer_greenlet'] = None
 
 
-def start_question_timer(code):
-    room = rooms.get(code)
-    if not room:
-        return
-    cancel_timer(room)
-    duration = room.get('timer_duration', 30)
-    g = eventlet.spawn(question_timer_worker, code, duration)
-    room['timer_greenlet'] = g
+def cancel_player_timer(p):
+    if p.get('timer_greenlet'):
+        try:
+            p['timer_greenlet'].kill()
+        except Exception:
+            pass
+        p['timer_greenlet'] = None
 
 
-def question_timer_worker(code, duration):
-    eventlet.sleep(duration)
-    room = rooms.get(code)
-    if not room or room['state'] != 'question':
-        return
-    for sid, p in room['players'].items():
-        if not p['answered']:
-            p['answered'] = True
-            p['answer'] = -1
-    check_round_end(code)
+def cancel_all_player_timers(room):
+    for p in room['players'].values():
+        cancel_player_timer(p)
 
 
 def generate_card_deck():
-    """5 cards: 2x -90, 2x +50, 1x swap"""
     cards = [
         {'type': 'minus', 'value': -90, 'label': '-90 Poin', 'icon': '💥'},
         {'type': 'minus', 'value': -90, 'label': '-90 Poin', 'icon': '💥'},
@@ -199,13 +205,65 @@ def generate_card_deck():
     return cards
 
 
-# ─── Classic Mode ─────────────────────────────────────────────────────────────
+def assign_team(room, sid):
+    """Auto-assign team alternating A/B."""
+    count = len(room['players'])
+    return 'A' if count % 2 == 0 else 'B'
+
+
+# ─── Classic / Team Mode ──────────────────────────────────────────────────────
+
+def start_room_timer(code):
+    room = rooms.get(code)
+    if not room:
+        return
+    cancel_room_timer(room)
+    duration = room.get('timer_duration', 30)
+    g = eventlet.spawn(room_timer_worker, code, duration)
+    room['timer_greenlet'] = g
+
+
+def room_timer_worker(code, duration):
+    eventlet.sleep(duration)
+    room = rooms.get(code)
+    if not room or room['state'] != 'question':
+        return
+    for p in room['players'].values():
+        if not p['answered']:
+            p['answered'] = True
+            p['answer'] = -1
+    end_round_classic(code)
+
+
+def send_question_classic(code):
+    room = rooms.get(code)
+    if not room:
+        return
+    room['state'] = 'question'
+    room['q_start_time'] = time.time()
+    q = room['questions'][room['current_q']]
+    for p in room['players'].values():
+        p['answered'] = False
+        p['answer'] = None
+        p['my_correct_idx'] = q['ans']
+
+    socketio.emit('new_question', {
+        'question': q['q'],
+        'opts': q['opts'],
+        'current_q': room['current_q'],
+        'total_q': len(room['questions']),
+        'num_opts': len(q['opts']),
+        'game_mode': room.get('game_mode', 'Classic'),
+        'my_correct_idx': q['ans'],
+    }, room=code)
+    start_room_timer(code)
+
 
 def end_round_classic(code):
     room = rooms.get(code)
     if not room:
         return
-    cancel_timer(room)
+    cancel_room_timer(room)
     room['state'] = 'result'
     q = room['questions'][room['current_q']]
     correct_idx = q['ans']
@@ -221,14 +279,13 @@ def end_round_classic(code):
         p['score'] += delta
         score_changes[sid] = delta
 
-    players = room['players']
     p_list = [
         {
             'name': v['name'], 'score': v['score'],
             'answer': v['answer'], 'delta': score_changes[k],
-            'id': v['id'], 'sid': k
+            'id': v['id'], 'sid': k, 'team': v.get('team'),
         }
-        for k, v in players.items()
+        for k, v in room['players'].items()
     ]
 
     socketio.emit('round_result', {
@@ -238,132 +295,14 @@ def end_round_classic(code):
         'opts': q['opts'],
         'current_q': room['current_q'],
         'total_q': len(room['questions']),
+        'game_mode': room.get('game_mode', 'Classic'),
     }, room=code)
 
-    eventlet.spawn(advance_question_after_delay, code)
+    broadcast_scoreboard(code)
+    eventlet.spawn(advance_classic_after_delay, code)
 
 
-# ─── Steal Mode ───────────────────────────────────────────────────────────────
-
-def send_question_steal(code):
-    room = rooms.get(code)
-    if not room:
-        return
-    room['state'] = 'question'
-    room['q_start_time'] = time.time()
-
-    sids = list(room['players'].keys())
-    q = room['questions'][room['current_q']]
-
-    for i, sid in enumerate(sids):
-        p = room['players'][sid]
-        p['answered'] = False
-        p['answer'] = None
-        p['card_picked'] = False
-        p['card_idx'] = None
-        p['card_effect'] = None
-
-    # In steal mode, each player gets their own question
-    # Player 1 gets current_q, Player 2 gets current_q+1 (wrapping)
-    q1 = room['questions'][room['current_q'] % len(room['questions'])]
-    q2 = room['questions'][(room['current_q'] + 1) % len(room['questions'])]
-
-    for i, sid in enumerate(sids):
-        player_q = q1 if i == 0 else q2
-        room['players'][sid]['question_idx'] = room['current_q'] if i == 0 else (room['current_q'] + 1) % len(room['questions'])
-        socketio.emit('new_question', {
-            'question': player_q['q'],
-            'opts': player_q['opts'],
-            'current_q': room['current_q'],
-            'total_q': len(room['questions']),
-            'num_opts': len(player_q['opts']),
-            'game_mode': 'Steal',
-            'my_correct_idx': player_q['ans'],
-        }, room=sid)
-
-    start_question_timer(code)
-
-
-def check_round_end(code):
-    room = rooms.get(code)
-    if not room:
-        return
-    game_mode = room.get('game_mode', 'Classic')
-
-    if game_mode == 'Classic':
-        all_answered = all(p['answered'] for p in room['players'].values())
-        if all_answered:
-            end_round_classic(code)
-    else:
-        # Steal mode
-        all_done = True
-        for sid, p in room['players'].items():
-            if not p['answered']:
-                all_done = False
-                break
-            if p['answer'] == p.get('my_correct_idx') and not p['card_picked']:
-                all_done = False
-                break
-        if all_done:
-            end_round_steal(code)
-
-
-def end_round_steal(code):
-    room = rooms.get(code)
-    if not room:
-        return
-    cancel_timer(room)
-    room['state'] = 'result'
-
-    # Apply card effects
-    sids = list(room['players'].keys())
-    p1 = room['players'][sids[0]]
-    p2 = room['players'][sids[1]]
-
-    # Handle swap: if both picked swap, they cancel out
-    p1_swap = p1.get('card_effect') == 'swap'
-    p2_swap = p2.get('card_effect') == 'swap'
-
-    if p1_swap and not p2_swap:
-        p1['score'], p2['score'] = p2['score'], p1['score']
-    elif p2_swap and not p1_swap:
-        p1['score'], p2['score'] = p2['score'], p1['score']
-    elif p1_swap and p2_swap:
-        pass  # both swap = no change
-
-    # Apply plus/minus
-    for sid in sids:
-        p = room['players'][sid]
-        eff = p.get('card_effect')
-        if eff == 'plus':
-            p['score'] += p.get('card_value', 0)
-        elif eff == 'minus':
-            p['score'] += p.get('card_value', 0)
-
-    p_list = [
-        {
-            'name': v['name'], 'score': v['score'],
-            'answer': v['answer'], 'delta': 0,
-            'id': v['id'], 'sid': k,
-            'card_effect': v.get('card_effect'),
-            'card_label': v.get('card_label', ''),
-            'card_icon': v.get('card_icon', ''),
-            'was_correct': v.get('answer') == v.get('my_correct_idx'),
-        }
-        for k, v in room['players'].items()
-    ]
-
-    socketio.emit('round_result', {
-        'players': p_list,
-        'current_q': room['current_q'],
-        'total_q': len(room['questions']),
-        'game_mode': 'Steal',
-    }, room=code)
-
-    eventlet.spawn(advance_question_after_delay, code)
-
-
-def advance_question_after_delay(code):
+def advance_classic_after_delay(code):
     eventlet.sleep(4.5)
     room = rooms.get(code)
     if not room:
@@ -372,53 +311,214 @@ def advance_question_after_delay(code):
     if room['current_q'] >= len(room['questions']):
         finish_game(code)
     else:
-        if room.get('game_mode') == 'Steal':
-            send_question_steal(code)
-        else:
-            send_question(code)
+        send_question_classic(code)
 
 
-def send_question(code):
+# ─── Steal Mode (Independent Progression) ─────────────────────────────────────
+
+def start_player_timer(code, sid):
     room = rooms.get(code)
     if not room:
         return
-    room['state'] = 'question'
-    room['q_start_time'] = time.time()
-    q = room['questions'][room['current_q']]
-    for p in room['players'].values():
-        p['answered'] = False
-        p['answer'] = None
+    p = room['players'].get(sid)
+    if not p:
+        return
+    cancel_player_timer(p)
+    duration = room.get('timer_duration', 30)
+    g = eventlet.spawn(player_timer_worker, code, sid, duration)
+    p['timer_greenlet'] = g
+
+
+def player_timer_worker(code, sid, duration):
+    eventlet.sleep(duration)
+    room = rooms.get(code)
+    if not room:
+        return
+    p = room['players'].get(sid)
+    if not p or p['answered'] or p.get('finished'):
+        return
+    p['answered'] = True
+    p['answer'] = -1
+    socketio.emit('steal_answer_result', {
+        'correct': False, 'timed_out': True,
+    }, room=sid)
+    eventlet.spawn(advance_player_steal_after_delay, code, sid, 2.0)
+
+
+def send_player_question_steal(code, sid):
+    room = rooms.get(code)
+    if not room:
+        return
+    p = room['players'].get(sid)
+    if not p or p.get('finished'):
+        return
+    if not p.get('my_questions'):
+        p['my_questions'] = list(room['questions'])
+        random.shuffle(p['my_questions'])
+
+    qi = p['q_index']
+    if qi >= len(p['my_questions']):
+        p['finished'] = True
+        socketio.emit('player_finished', {}, room=sid)
+        check_all_finished_steal(code)
+        return
+
+    q = p['my_questions'][qi]
+    p['answered'] = False
+    p['answer'] = None
+    p['card_picked'] = False
+    p['card_effect'] = None
+    p['card_idx'] = None
+    p['my_correct_idx'] = q['ans']
 
     socketio.emit('new_question', {
         'question': q['q'],
         'opts': q['opts'],
-        'current_q': room['current_q'],
-        'total_q': len(room['questions']),
+        'current_q': qi,
+        'total_q': len(p['my_questions']),
         'num_opts': len(q['opts']),
-        'game_mode': room.get('game_mode', 'Classic'),
-    }, room=code)
-    start_question_timer(code)
+        'game_mode': 'Steal',
+        'my_correct_idx': q['ans'],
+    }, room=sid)
+    start_player_timer(code, sid)
 
+
+def advance_player_steal_after_delay(code, sid, delay=2.0):
+    eventlet.sleep(delay)
+    room = rooms.get(code)
+    if not room:
+        return
+    p = room['players'].get(sid)
+    if not p or p.get('finished'):
+        return
+    p['q_index'] += 1
+    send_player_question_steal(code, sid)
+
+
+def handle_steal_answer(code, sid, answer):
+    room = rooms.get(code)
+    if not room:
+        return
+    p = room['players'].get(sid)
+    if not p or p['answered']:
+        return
+    cancel_player_timer(p)
+    p['answered'] = True
+    p['answer'] = answer
+
+    was_correct = (answer == p.get('my_correct_idx'))
+    if was_correct:
+        cards = generate_card_deck()
+        p['card_deck'] = cards
+        socketio.emit('card_pick', {
+            'cards': [{'label': c['label'], 'icon': c['icon'], 'type': c['type']} for c in cards],
+        }, room=sid)
+    else:
+        socketio.emit('steal_answer_result', {
+            'correct': False, 'timed_out': False,
+        }, room=sid)
+        eventlet.spawn(advance_player_steal_after_delay, code, sid, 2.0)
+
+
+def handle_steal_pick_card(code, sid, card_idx):
+    room = rooms.get(code)
+    if not room:
+        return
+    p = room['players'].get(sid)
+    if not p or p.get('card_picked'):
+        return
+
+    cards = p.get('card_deck', [])
+    if card_idx is None or card_idx < 0 or card_idx >= len(cards):
+        card_idx = 0
+
+    card = cards[card_idx]
+    p['card_picked'] = True
+    p['card_idx'] = card_idx
+    p['card_effect'] = card['type']
+    p['card_value'] = card['value']
+    p['card_label'] = card['label']
+    p['card_icon'] = card['icon']
+
+    # Apply card effect
+    if card['type'] == 'plus':
+        p['score'] += card['value']
+    elif card['type'] == 'minus':
+        p['score'] += card['value']
+    elif card['type'] == 'swap':
+        # Swap with a random other player
+        others = [s for s in room['players'] if s != sid and not room['players'][s].get('finished')]
+        if others:
+            target_sid = random.choice(others)
+            target = room['players'][target_sid]
+            p['score'], target['score'] = target['score'], p['score']
+
+    socketio.emit('card_revealed', {
+        'card_idx': card_idx,
+        'card': {'label': card['label'], 'icon': card['icon'], 'type': card['type']},
+    }, room=sid)
+
+    broadcast_scoreboard(code)
+    eventlet.spawn(advance_player_steal_after_delay, code, sid, 3.0)
+
+
+def check_all_finished_steal(code):
+    room = rooms.get(code)
+    if not room:
+        return
+    all_done = all(p.get('finished', False) for p in room['players'].values())
+    if all_done:
+        finish_game(code)
+
+
+def start_steal_game(code):
+    room = rooms.get(code)
+    if not room:
+        return
+    room['state'] = 'question'
+    for sid in room['players']:
+        send_player_question_steal(code, sid)
+
+
+# ─── Finish Game ──────────────────────────────────────────────────────────────
 
 def finish_game(code):
     room = rooms.get(code)
     if not room:
         return
-    cancel_timer(room)
+    cancel_room_timer(room)
+    cancel_all_player_timers(room)
     room['state'] = 'finished'
     players = room['players']
+    game_mode = room.get('game_mode', 'Classic')
+
     p_list = sorted(
-        [{'name': v['name'], 'score': v['score'], 'id': v['id']} for v in players.values()],
+        [{'name': v['name'], 'score': v['score'], 'id': v['id'], 'team': v.get('team')} for v in players.values()],
         key=lambda x: x['score'], reverse=True
     )
-    socketio.emit('game_over', {'rankings': p_list}, room=code)
+
+    result = {'rankings': p_list, 'game_mode': game_mode}
+
+    if game_mode == 'Team':
+        teams = {}
+        for p in p_list:
+            t = p.get('team')
+            if t:
+                tn = TEAM_NAMES[0] if t == 'A' else TEAM_NAMES[1]
+                if tn not in teams:
+                    teams[tn] = {'team': t, 'name': tn, 'score': 0, 'members': []}
+                teams[tn]['score'] += p['score']
+                teams[tn]['members'].append(p)
+        result['team_rankings'] = sorted(teams.values(), key=lambda x: x['score'], reverse=True)
+
+    socketio.emit('game_over', result, room=code)
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE, modes=MODES, game_modes=GAME_MODES, timer_options=TIMER_OPTIONS)
+    return render_template_string(HTML_TEMPLATE, modes=MODES, game_modes=GAME_MODES, timer_options=TIMER_OPTIONS, max_players=MAX_PLAYERS)
 
 
 # ─── Socket.IO Handlers ───────────────────────────────────────────────────────
@@ -431,49 +531,7 @@ def on_connect():
 @socketio.on('disconnect')
 def on_disconnect():
     sid = request.sid
-    code = None
-    room = None
-    for c, r in list(rooms.items()):
-        if sid in r['players']:
-            code = c
-            room = r
-            break
-    if not code or not room:
-        return
-
-    disconnected_player = room['players'].get(sid)
-    if not disconnected_player:
-        return
-
-    pid = disconnected_player['id']
-    if pid in player_sessions:
-        player_sessions[pid]['sid'] = None
-
-    if room['state'] == 'lobby':
-        del room['players'][sid]
-        if len(room['players']) == 0:
-            del rooms[code]
-            if pid in player_sessions:
-                del player_sessions[pid]
-        else:
-            if room['host'] == sid:
-                room['host'] = next(iter(room['players']))
-            socketio.emit('room_update', room_summary(code, room), room=code)
-    else:
-        cancel_timer(room)
-        remaining = [
-            {'name': v['name'], 'score': v['score'], 'id': v['id']}
-            for k, v in room['players'].items() if k != sid
-        ]
-        disconnected_name = disconnected_player['name']
-        socketio.emit('opponent_disconnected', {
-            'disconnected_name': disconnected_name,
-            'remaining_players': remaining,
-        }, room=code)
-        del rooms[code]
-        for p_id, info in list(player_sessions.items()):
-            if info.get('room_code') == code:
-                del player_sessions[p_id]
+    _remove_player(sid)
 
 
 @socketio.on('restore_session')
@@ -507,6 +565,8 @@ def on_restore_session(data):
         room['players'][sid] = room['players'].pop(old_sid)
         if room['host'] == old_sid:
             room['host'] = sid
+        cancel_player_timer(player_data)
+        player_data['answered'] = True
 
     player_sessions[player_id] = {'room_code': room_code, 'sid': sid}
     join_room(room_code)
@@ -518,50 +578,42 @@ def on_restore_session(data):
         'name': player_data['name'],
         'state': state,
         'is_host': room['host'] == sid,
-        'room_info': room_summary(room_code, room, for_sid=sid),
+        'room_info': room_summary(room_code, room),
     }
 
     if state == 'question':
         game_mode = room.get('game_mode', 'Classic')
         if game_mode == 'Steal':
-            q_idx = player_data.get('question_idx', room['current_q'])
-            q = room['questions'][q_idx % len(room['questions'])]
+            qi = player_data.get('q_index', 0)
+            mq = player_data.get('my_questions') or room['questions']
+            q = mq[qi % len(mq)]
             elapsed = time.time() - room.get('q_start_time', time.time())
             remaining_time = max(0, room.get('timer_duration', 30) - int(elapsed))
             restore_data['question_data'] = {
-                'question': q['q'],
-                'opts': q['opts'],
-                'current_q': room['current_q'],
-                'total_q': len(room['questions']),
-                'num_opts': len(q['opts']),
-                'remaining_time': remaining_time,
+                'question': q['q'], 'opts': q['opts'],
+                'current_q': qi, 'total_q': len(mq),
+                'num_opts': len(q['opts']), 'remaining_time': remaining_time,
                 'already_answered': player_data.get('answered', False),
                 'my_answer': player_data.get('answer'),
-                'game_mode': 'Steal',
-                'my_correct_idx': q['ans'],
+                'game_mode': 'Steal', 'my_correct_idx': q['ans'],
             }
         else:
             q = room['questions'][room['current_q']]
             elapsed = time.time() - room.get('q_start_time', time.time())
             remaining_time = max(0, room.get('timer_duration', 30) - int(elapsed))
             restore_data['question_data'] = {
-                'question': q['q'],
-                'opts': q['opts'],
-                'current_q': room['current_q'],
-                'total_q': len(room['questions']),
-                'num_opts': len(q['opts']),
-                'remaining_time': remaining_time,
+                'question': q['q'], 'opts': q['opts'],
+                'current_q': room['current_q'], 'total_q': len(room['questions']),
+                'num_opts': len(q['opts']), 'remaining_time': remaining_time,
                 'already_answered': player_data.get('answered', False),
                 'my_answer': player_data.get('answer'),
-                'game_mode': 'Classic',
+                'game_mode': game_mode,
             }
     elif state == 'finished':
-        players = room['players']
-        p_list = sorted(
-            [{'name': v['name'], 'score': v['score'], 'id': v['id']} for v in players.values()],
+        restore_data['rankings'] = sorted(
+            [{'name': v['name'], 'score': v['score'], 'id': v['id'], 'team': v.get('team')} for v in room['players'].values()],
             key=lambda x: x['score'], reverse=True
         )
-        restore_data['rankings'] = p_list
 
     emit('session_restored', restore_data)
 
@@ -589,17 +641,9 @@ def on_create_room(data):
     questions = list(QUIZ_DATA[mode])
     random.shuffle(questions)
 
+    team = 'A' if game_mode == 'Team' else None
     rooms[code] = {
-        'players': {
-            sid: {
-                'name': name, 'score': 0, 'answered': False,
-                'answer': None, 'id': player_id,
-                'card_picked': False, 'card_idx': None,
-                'card_effect': None, 'card_value': 0,
-                'card_label': '', 'card_icon': '',
-                'question_idx': 0, 'my_correct_idx': None,
-            }
-        },
+        'players': {sid: new_player(name, player_id, team)},
         'host': sid,
         'mode': mode,
         'game_mode': game_mode,
@@ -635,21 +679,15 @@ def on_join_room(data):
         return
 
     room = rooms[code]
-    if len(room['players']) >= 2:
-        emit('join_error', {'message': 'Room sudah penuh!'})
+    if len(room['players']) >= MAX_PLAYERS:
+        emit('join_error', {'message': 'Room sudah penuh (maks 6 pemain)!'})
         return
     if room['state'] != 'lobby':
         emit('join_error', {'message': 'Permainan sudah dimulai!'})
         return
 
-    room['players'][sid] = {
-        'name': name, 'score': 0, 'answered': False,
-        'answer': None, 'id': player_id,
-        'card_picked': False, 'card_idx': None,
-        'card_effect': None, 'card_value': 0,
-        'card_label': '', 'card_icon': '',
-        'question_idx': 0, 'my_correct_idx': None,
-    }
+    team = assign_team(room, sid) if room.get('game_mode') == 'Team' else None
+    room['players'][sid] = new_player(name, player_id, team)
     player_sessions[player_id] = {'room_code': code, 'sid': sid}
     join_room(code)
 
@@ -675,12 +713,14 @@ def on_start_game(data):
         emit('error_msg', {'message': 'Hanya host yang bisa memulai!'})
         return
     if len(room['players']) < 2:
-        emit('error_msg', {'message': 'Butuh 2 pemain untuk memulai!'})
+        emit('error_msg', {'message': 'Butuh minimal 2 pemain untuk memulai!'})
         return
-    if room.get('game_mode') == 'Steal':
-        send_question_steal(code)
+
+    game_mode = room.get('game_mode', 'Classic')
+    if game_mode == 'Steal':
+        start_steal_game(code)
     else:
-        send_question(code)
+        send_question_classic(code)
 
 
 @socketio.on('submit_answer')
@@ -696,36 +736,19 @@ def on_submit_answer(data):
     if not player or player['answered']:
         return
 
-    player['answered'] = True
-    player['answer'] = answer
-
     game_mode = room.get('game_mode', 'Classic')
 
-    if game_mode == 'Classic':
+    if game_mode == 'Steal':
+        handle_steal_answer(code, sid, answer)
+    else:
+        player['answered'] = True
+        player['answer'] = answer
         for other_sid in room['players']:
             if other_sid != sid:
                 socketio.emit('opponent_answered', {}, room=other_sid)
         all_answered = all(p['answered'] for p in room['players'].values())
         if all_answered:
             end_round_classic(code)
-    else:
-        # Steal mode
-        was_correct = (answer == player.get('my_correct_idx'))
-        for other_sid in room['players']:
-            if other_sid != sid:
-                socketio.emit('opponent_answered', {}, room=other_sid)
-
-        if was_correct:
-            # Generate card deck for this player
-            cards = generate_card_deck()
-            player['card_deck'] = cards
-            socketio.emit('card_pick', {
-                'cards': [{'label': c['label'], 'icon': c['icon'], 'type': c['type']} for c in cards],
-            }, room=sid)
-        else:
-            player['card_picked'] = True  # no card to pick
-
-        check_round_end(code)
 
 
 @socketio.on('pick_card')
@@ -736,28 +759,10 @@ def on_pick_card(data):
     room = rooms.get(code)
     if not room:
         return
-    player = room['players'].get(sid)
-    if not player or player.get('card_picked'):
+    game_mode = room.get('game_mode', 'Classic')
+    if game_mode != 'Steal':
         return
-
-    cards = player.get('card_deck', [])
-    if card_idx is None or card_idx < 0 or card_idx >= len(cards):
-        card_idx = 0
-
-    card = cards[card_idx]
-    player['card_picked'] = True
-    player['card_idx'] = card_idx
-    player['card_effect'] = card['type']
-    player['card_value'] = card['value']
-    player['card_label'] = card['label']
-    player['card_icon'] = card['icon']
-
-    socketio.emit('card_revealed', {
-        'card_idx': card_idx,
-        'card': {'label': card['label'], 'icon': card['icon'], 'type': card['type']},
-    }, room=sid)
-
-    check_round_end(code)
+    handle_steal_pick_card(code, sid, card_idx)
 
 
 @socketio.on('leave_room')
@@ -767,38 +772,73 @@ def on_leave_room(data):
     room = rooms.get(code)
     if not room:
         return
+    player = room['players'].get(sid)
+    if not player:
+        return
+    pid = player['id']
+    leave_room(code)
+    _remove_player(sid, code)
+
+
+def _remove_player(sid, code=None):
+    found_code = code
+    room = None
+    if found_code:
+        room = rooms.get(found_code)
+    if not room:
+        for c, r in list(rooms.items()):
+            if sid in r['players']:
+                found_code = c
+                room = r
+                break
+    if not room or not found_code:
+        return
 
     player = room['players'].get(sid)
     if not player:
         return
 
     pid = player['id']
-    leave_room(code)
+    cancel_player_timer(player)
 
-    if room['state'] != 'lobby':
-        cancel_timer(room)
-        remaining = [
-            {'name': v['name'], 'score': v['score'], 'id': v['id']}
-            for k, v in room['players'].items() if k != sid
-        ]
-        socketio.emit('opponent_disconnected', {
-            'disconnected_name': player['name'],
-            'remaining_players': remaining,
-        }, room=code)
-        del rooms[code]
-        for p_id, info in list(player_sessions.items()):
-            if info.get('room_code') == code:
-                del player_sessions[p_id]
-    else:
+    if pid in player_sessions:
+        del player_sessions[pid]
+
+    if room['state'] == 'lobby':
         del room['players'][sid]
-        if pid in player_sessions:
-            del player_sessions[pid]
         if len(room['players']) == 0:
-            del rooms[code]
+            del rooms[found_code]
         else:
             if room['host'] == sid:
                 room['host'] = next(iter(room['players']))
-            socketio.emit('room_update', room_summary(code, room), room=code)
+            socketio.emit('room_update', room_summary(found_code, room), room=found_code)
+    else:
+        game_mode = room.get('game_mode', 'Classic')
+        del room['players'][sid]
+        if len(room['players']) == 0:
+            cancel_room_timer(room)
+            del rooms[found_code]
+        elif game_mode == 'Steal':
+            remaining = [
+                {'name': v['name'], 'score': v['score'], 'id': v['id'], 'finished': v.get('finished', False)}
+                for v in room['players'].values()
+            ]
+            socketio.emit('player_left', {
+                'left_name': player['name'],
+                'remaining_players': remaining,
+            }, room=found_code)
+            check_all_finished_steal(found_code)
+        else:
+            cancel_room_timer(room)
+            remaining = [
+                {'name': v['name'], 'score': v['score'], 'id': v['id']}
+                for v in room['players'].values()
+            ]
+            socketio.emit('opponent_disconnected', {
+                'disconnected_name': player['name'],
+                'remaining_players': remaining,
+            }, room=found_code)
+            del rooms[found_code]
 
 
 # ─── Chat Handler ────────────────────────────────────────────────────────────
@@ -884,7 +924,6 @@ def on_voice_start(data):
     room = rooms.get(code)
     if not room:
         return
-    # Tell the other peer to create an answer
     for other_sid in room['players']:
         if other_sid != sid:
             socketio.emit('voice_start', {
@@ -927,7 +966,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .anim-bounceIn{animation:bounceIn 0.6s ease forwards;}
   .anim-fadeIn{animation:fadeIn 0.3s ease forwards;}
   .anim-cardFlip{animation:cardFlip 0.6s ease forwards;}
-  .anim-glow{animation:glow 1.5s ease infinite;}
 
   .btn-answer{
     position:relative;overflow:hidden;cursor:pointer;border:none;
@@ -996,25 +1034,34 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .select-field option{background:#2d0a5e;}
 
+  /* Multi-player scoreboard */
   .scoreboard{
     background:rgba(0,0,0,0.4);backdrop-filter:blur(8px);
     border-bottom:2px solid rgba(255,255,255,0.1);
-    padding:10px 20px;display:flex;justify-content:space-between;align-items:center;
-    position:relative;
+    padding:8px 16px;display:flex;align-items:center;gap:8px;
+    overflow-x:auto;position:relative;
   }
-  .score-box{text-align:center;position:relative;min-width:100px;}
-  .score-name{font-size:0.85rem;font-weight:700;opacity:0.8;text-transform:uppercase;letter-spacing:1px;}
-  .score-val{font-size:1.8rem;font-weight:900;}
-  .vs-badge{font-size:1.2rem;font-weight:900;color:#f39c12;text-shadow:0 0 10px rgba(243,156,18,0.5);}
+  .sb-player{
+    text-align:center;min-width:80px;padding:4px 10px;border-radius:10px;
+    background:rgba(255,255,255,0.08);position:relative;flex-shrink:0;
+    border:2px solid transparent;
+  }
+  .sb-player.me{border-color:#f39c12;}
+  .sb-player.team-A{border-color:#2980b9;}
+  .sb-player.team-B{border-color:#e67e22;}
+  .sb-name{font-size:0.7rem;font-weight:700;opacity:0.8;text-transform:uppercase;letter-spacing:0.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .sb-val{font-size:1.3rem;font-weight:900;}
+  .sb-team-tag{font-size:0.6rem;font-weight:800;padding:1px 6px;border-radius:8px;display:inline-block;margin-top:2px;}
+  .sb-team-tag.A{background:#2980b9;color:#fff;}
+  .sb-team-tag.B{background:#e67e22;color:#fff;}
+  .sb-finished{font-size:0.55rem;font-weight:800;color:#2ecc71;}
 
   .top-points-badge{
-    position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
     background:linear-gradient(135deg,#f39c12,#e67e22);
-    padding:4px 16px;border-radius:20px;font-size:0.75rem;font-weight:800;
+    padding:3px 12px;border-radius:20px;font-size:0.7rem;font-weight:800;
     color:#1a0533;white-space:nowrap;box-shadow:0 2px 10px rgba(243,156,18,0.4);
-    display:none;
+    flex-shrink:0;
   }
-  .top-points-badge.show{display:block;}
 
   .question-card{
     background:#fff;color:#1a0533;border-radius:20px;padding:28px 24px;
@@ -1048,15 +1095,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   .player-slot{
     background:rgba(255,255,255,0.08);border:2px dashed rgba(255,255,255,0.3);
-    border-radius:14px;padding:16px;display:flex;align-items:center;gap:14px;
+    border-radius:14px;padding:12px;display:flex;align-items:center;gap:12px;
   }
   .player-slot.filled{border-style:solid;border-color:rgba(255,255,255,0.5);background:rgba(255,255,255,0.12);}
+  .player-slot.team-A{border-color:#2980b9;}
+  .player-slot.team-B{border-color:#e67e22;}
   .player-avatar{
-    width:48px;height:48px;border-radius:50%;background:linear-gradient(135deg,#9b59b6,#e74c3c);
-    display:flex;align-items:center;justify-content:center;font-size:1.3rem;font-weight:900;flex-shrink:0;
+    width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#9b59b6,#e74c3c);
+    display:flex;align-items:center;justify-content:center;font-size:1.1rem;font-weight:900;flex-shrink:0;
   }
 
-  /* Card pick grid */
   .card-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:16px 0;}
   .pick-card{
     aspect-ratio:3/4;border-radius:14px;cursor:pointer;
@@ -1078,7 +1126,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .pick-card.revealed .card-front{display:flex;}
   .card-front-label{font-size:0.7rem;font-weight:800;text-align:center;}
 
-  /* Chat */
   .chat-panel{
     position:fixed;right:0;top:0;height:100vh;width:320px;
     background:rgba(20,0,40,0.95);backdrop-filter:blur(20px);
@@ -1123,7 +1170,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .chat-badge.show{display:flex;}
 
-  /* Voice */
   .voice-btn{
     position:fixed;right:80px;bottom:16px;width:52px;height:52px;border-radius:50%;
     background:rgba(255,255,255,0.15);border:2px solid rgba(255,255,255,0.3);
@@ -1137,9 +1183,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .voice-btn.muted{background:rgba(231,76,60,0.3);border-color:#e74c3c;}
 
   .mode-btn{
-    padding:10px 20px;border-radius:10px;border:2px solid rgba(255,255,255,0.3);
+    padding:10px 16px;border-radius:10px;border:2px solid rgba(255,255,255,0.3);
     background:rgba(255,255,255,0.08);color:#fff;font-family:'Montserrat',sans-serif;
-    font-size:0.9rem;font-weight:700;cursor:pointer;transition:all 0.2s;
+    font-size:0.85rem;font-weight:700;cursor:pointer;transition:all 0.2s;
   }
   .mode-btn.active{background:linear-gradient(135deg,#f39c12,#e67e22);border-color:#f39c12;color:#1a0533;}
   .timer-btn{
@@ -1148,6 +1194,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     font-size:0.85rem;font-weight:700;cursor:pointer;transition:all 0.2s;
   }
   .timer-btn.active{background:#27ae60;border-color:#2ecc71;}
+
+  .steal-result{
+    background:linear-gradient(135deg,rgba(0,0,0,0.85),rgba(0,0,0,0.7));
+    backdrop-filter:blur(4px);border-radius:16px;padding:24px;text-align:center;
+    margin-bottom:16px;
+  }
 </style>
 </head>
 <body>
@@ -1157,7 +1209,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div style="max-width:440px;width:100%;" class="anim-slideUp">
     <div class="text-center mb-8">
       <div style="font-size:3.5rem;font-weight:900;background:linear-gradient(135deg,#f39c12,#e74c3c,#9b59b6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;letter-spacing:-1px;">QuizBattle!</div>
-      <div style="color:rgba(255,255,255,0.6);font-size:0.9rem;font-weight:600;margin-top:4px;">1v1 Quiz Game • Kahoot Style</div>
+      <div style="color:rgba(255,255,255,0.6);font-size:0.9rem;font-weight:600;margin-top:4px;">Quiz Multiplayer • Kahoot Style</div>
     </div>
 
     <div class="card p-6 mb-4">
@@ -1169,10 +1221,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div style="font-size:1rem;font-weight:800;margin-bottom:16px;">🎮 Buat Room Baru</div>
 
       <div style="font-size:0.8rem;font-weight:700;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Game Mode</div>
-      <div id="game-mode-buttons" style="display:flex;gap:8px;margin-bottom:16px;">
+      <div id="game-mode-buttons" style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;">
         {% for gm in game_modes %}
         <button class="mode-btn {% if loop.first %}active{% endif %}" data-gm="{{ gm }}" onclick="selectGameMode('{{ gm }}')">
-          {% if gm == 'Classic' %}🎯 Classic{% else %}🃏 Steal{% endif %}
+          {% if gm == 'Classic' %}🎯 Classic{% elif gm == 'Steal' %}🃏 Steal{% else %}👥 Team{% endif %}
         </button>
         {% endfor %}
       </div>
@@ -1202,8 +1254,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="menu-error" style="display:none;background:rgba(231,76,60,0.3);border:1px solid #e74c3c;border-radius:10px;padding:12px;margin-top:12px;text-align:center;font-weight:700;font-size:0.9rem;" class="anim-shake"></div>
 
     <div style="margin-top:16px;padding:12px;background:rgba(255,255,255,0.05);border-radius:12px;font-size:0.8rem;color:rgba(255,255,255,0.5);line-height:1.5;">
-      <b style="color:#f39c12;">🎯 Classic:</b> Soal sama untuk keduanya, siapa cepat dia dapat.<br/>
-      <b style="color:#9b59b6;">🃏 Steal:</b> Soal sendiri-sendiri. Jawab benar = ambil 1 kartu dari 5 (2 kartu -90 poin, 2 kartu +50 poin, 1 kartu swap poin!).
+      <b style="color:#f39c12;">🎯 Classic:</b> Soal sama untuk semua, siapa cepat dia dapat.<br/>
+      <b style="color:#9b59b6;">🃏 Steal:</b> Soal sendiri-sendiri, jawab benar = ambil kartu (2x -90, 2x +50, 1x swap). Tidak perlu nunggu lawan!<br/>
+      <b style="color:#2980b9;">👥 Team:</b> Dibagi 2 tim, skor digabung. Maks {{ max_players }} pemain!
     </div>
   </div>
 </div>
@@ -1224,7 +1277,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <div class="mb-5">
-      <div style="font-size:0.85rem;font-weight:700;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">Pemain (0/2)</div>
+      <div style="font-size:0.85rem;font-weight:700;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;" id="lobby-player-count">Pemain (0/6)</div>
       <div id="lobby-players" style="display:flex;flex-direction:column;gap:10px;"></div>
     </div>
 
@@ -1242,20 +1295,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <!-- ═══════════════════════ SCREEN: GAME ═══════════════════════ -->
 <div id="screen-game" class="screen" style="flex-direction:column;">
-  <div class="scoreboard" id="scoreboard">
-    <div class="score-box" id="score-p1-box">
-      <div class="score-name" id="score-p1-name">P1</div>
-      <div class="score-val" id="score-p1-val">0</div>
-    </div>
-    <div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
-      <div class="vs-badge">VS</div>
-      <div class="top-points-badge" id="top-points-badge">TOP: 0</div>
-    </div>
-    <div class="score-box" id="score-p2-box">
-      <div class="score-name" id="score-p2-name">P2</div>
-      <div class="score-val" id="score-p2-val">0</div>
-    </div>
-  </div>
+  <div class="scoreboard" id="scoreboard"></div>
 
   <div style="flex:1;overflow-y:auto;padding:16px;" id="game-content">
     <div class="timer-bar-container mb-3">
@@ -1287,6 +1327,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <div id="answer-buttons" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;"></div>
 
+    <!-- Steal mode result (personal) -->
+    <div id="steal-result-section" style="display:none;">
+      <div class="steal-result anim-bounceIn" id="steal-result-box">
+        <div id="steal-result-icon" style="font-size:3rem;margin-bottom:8px;"></div>
+        <div id="steal-result-text" style="font-size:1.3rem;font-weight:900;margin-bottom:4px;"></div>
+        <div id="steal-result-detail" style="font-size:1rem;font-weight:700;"></div>
+      </div>
+    </div>
+
     <!-- Card pick section (Steal mode) -->
     <div id="card-pick-section" style="display:none;">
       <div class="card p-4 mb-4 anim-bounceIn" style="text-align:center;">
@@ -1303,32 +1352,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="waiting-opponent" style="display:none;text-align:center;padding:16px 0;color:rgba(255,255,255,0.7);font-weight:700;">
       <div class="anim-pulse">⏳ Menunggu lawan...</div>
     </div>
+
+    <div id="player-finished-section" style="display:none;text-align:center;padding:32px 16px;">
+      <div style="font-size:4rem;margin-bottom:12px;">✅</div>
+      <div style="font-size:1.5rem;font-weight:900;margin-bottom:8px;">Kamu Selesai!</div>
+      <div style="color:rgba(255,255,255,0.7);font-size:0.95rem;" class="anim-pulse" id="finished-waiting-text">Menunggu pemain lain selesai...</div>
+    </div>
   </div>
 </div>
 
 <!-- ═══════════════════════ SCREEN: RESULT ═══════════════════════ -->
 <div id="screen-result" class="screen" style="flex-direction:column;">
-  <div class="scoreboard" id="scoreboard-result">
-    <div class="score-box">
-      <div class="score-name" id="res-p1-name">P1</div>
-      <div class="score-val" id="res-p1-val">0</div>
-    </div>
-    <div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
-      <div class="vs-badge">VS</div>
-      <div class="top-points-badge" id="top-points-badge-result">TOP: 0</div>
-    </div>
-    <div class="score-box">
-      <div class="score-name" id="res-p2-name">P2</div>
-      <div class="score-val" id="res-p2-val">0</div>
-    </div>
-  </div>
+  <div class="scoreboard" id="scoreboard-result"></div>
 
   <div style="flex:1;overflow-y:auto;padding:16px;" id="result-content">
     <div class="result-feedback mb-4 anim-popIn" id="round-feedback">
       <div id="result-icon" style="font-size:3rem;margin-bottom:8px;"></div>
       <div id="result-text" style="font-size:1.3rem;font-weight:900;margin-bottom:4px;"></div>
       <div id="result-delta" style="font-size:1.1rem;font-weight:700;"></div>
-      <div id="result-card-info" style="display:none;margin-top:8px;font-size:1rem;font-weight:800;"></div>
     </div>
 
     <div id="result-answers" style="display:flex;flex-direction:column;gap:8px;"></div>
@@ -1337,11 +1378,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <!-- ═══════════════════════ SCREEN: FINAL ═══════════════════════ -->
 <div id="screen-final" class="screen items-center justify-center p-6">
-  <div style="max-width:440px;width:100%;text-align:center;" class="anim-bounceIn">
+  <div style="max-width:500px;width:100%;text-align:center;" class="anim-bounceIn">
     <div id="final-title" style="font-size:2.5rem;font-weight:900;margin-bottom:6px;"></div>
     <div id="final-subtitle" style="font-size:1rem;color:rgba(255,255,255,0.7);margin-bottom:24px;"></div>
 
-    <div id="final-rankings" style="display:flex;flex-direction:column;gap:12px;margin-bottom:24px;"></div>
+    <div id="final-team-rankings" style="display:none;margin-bottom:20px;"></div>
+
+    <div style="font-size:0.85rem;font-weight:700;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;text-align:left;">Individual Rankings</div>
+    <div id="final-rankings" style="display:flex;flex-direction:column;gap:10px;margin-bottom:24px;"></div>
 
     <button class="btn-primary" onclick="goHome()" style="font-size:1rem;">🏠 Kembali ke Menu</button>
   </div>
@@ -1351,10 +1395,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div id="screen-disconnected" class="screen items-center justify-center p-6">
   <div style="max-width:400px;width:100%;text-align:center;" class="anim-bounceIn">
     <div style="font-size:5rem;margin-bottom:16px;">🏳️</div>
-    <div style="font-size:2rem;font-weight:900;margin-bottom:8px;">KAMU MENANG!</div>
-    <div style="font-size:1.1rem;color:rgba(255,255,255,0.7);margin-bottom:24px;">Lawan menyerah dari pertandingan</div>
+    <div style="font-size:2rem;font-weight:900;margin-bottom:8px;">Permainan Berakhir</div>
+    <div style="font-size:1.1rem;color:rgba(255,255,255,0.7);margin-bottom:24px;" id="disconnected-reason">Seorang pemain keluar dari pertandingan</div>
 
-    <div id="disconnected-scores" class="card p-4 mb-6" style="display:flex;justify-content:space-around;"></div>
+    <div id="disconnected-scores" class="card p-4 mb-6" style="display:flex;justify-content:space-around;flex-wrap:wrap;gap:12px;"></div>
 
     <button class="btn-primary" onclick="goHome()">🏠 Kembali ke Menu</button>
   </div>
@@ -1403,6 +1447,11 @@ let chatOpen = false;
 let unreadChat = 0;
 let cardDeck = [];
 let cardPicked = false;
+let currentPlayers = [];
+let myTeam = null;
+
+const TEAM_NAMES = {'A': 'Tim Alpha', 'B': 'Tim Bravo'};
+const TEAM_COLORS = {'A': '#2980b9', 'B': '#e67e22'};
 
 // Voice
 let localStream = null;
@@ -1422,7 +1471,7 @@ function showScreen(id) {
 function updateFloatingButtons() {
   const chatBtn = document.getElementById('chat-toggle-btn');
   const voiceBtn = document.getElementById('voice-btn');
-  const showBtns = ['lobby', 'question', 'result', 'finished'].includes(gameState);
+  const showBtns = ['lobby', 'game', 'result', 'finished'].includes(gameState);
   if (showBtns) {
     chatBtn.classList.add('show');
     voiceBtn.classList.add('show');
@@ -1519,70 +1568,84 @@ function updateTimerDisplay(secs) {
   }
 }
 
-// ═══════════════════════ TOP POINTS ═══════════════════════
-function updateTopPoints(players) {
-  if (!players || players.length < 2) return;
-  const topPlayer = players.reduce((a, b) => a.score >= b.score ? a : b);
-  const badges = ['top-points-badge', 'top-points-badge-result'];
-  badges.forEach(id => {
-    const el = document.getElementById(id);
-    if (el) {
-      el.textContent = '👑 TOP: ' + topPlayer.score + ' (' + topPlayer.name + ')';
-      el.classList.add('show');
+// ═══════════════════════ SCOREBOARD ═══════════════════════
+function renderScoreboard(containerId, players) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.innerHTML = '';
+
+  // Top points badge
+  if (players.length >= 2) {
+    const topPlayer = players.reduce((a, b) => a.score >= b.score ? a : b);
+    const badge = document.createElement('div');
+    badge.className = 'top-points-badge';
+    badge.textContent = '👑 ' + topPlayer.score + ' (' + topPlayer.name + ')';
+    container.appendChild(badge);
+  }
+
+  players.forEach(p => {
+    const div = document.createElement('div');
+    const isMe = p.id === myPlayerId;
+    const teamClass = p.team ? 'team-' + p.team : '';
+    div.className = 'sb-player ' + teamClass + (isMe ? ' me' : '');
+    let html = '<div class="sb-name">' + escapeHtml(p.name) + '</div>';
+    html += '<div class="sb-val">' + p.score + '</div>';
+    if (p.team) {
+      html += '<div class="sb-team-tag ' + p.team + '">' + (p.team === 'A' ? 'Alpha' : 'Bravo') + '</div>';
     }
+    if (p.finished) {
+      html += '<div class="sb-finished">✅ Selesai</div>';
+    }
+    div.innerHTML = html;
+    container.appendChild(div);
   });
 }
 
-// ═══════════════════════ SCORE ANIMATION ═══════════════════════
-function animateScoreDelta(containerId, delta) {
-  const container = document.getElementById(containerId);
-  if (!container) return;
-  const el = document.createElement('div');
-  el.className = 'score-float';
-  el.textContent = delta > 0 ? '+' + delta : delta;
-  el.style.color = delta > 0 ? '#2ecc71' : '#e74c3c';
-  el.style.top = '0';
-  el.style.left = '50%';
-  el.style.transform = 'translateX(-50%)';
-  container.appendChild(el);
-  setTimeout(() => el.remove(), 1300);
+function updateScoreboardFromPlayers(players) {
+  currentPlayers = players;
+  renderScoreboard('scoreboard', players);
+  renderScoreboard('scoreboard-result', players);
 }
 
 // ═══════════════════════ LOBBY ═══════════════════════
 function updateLobbyUI(roomInfo) {
   document.getElementById('lobby-code').textContent = roomInfo.code;
   document.getElementById('lobby-mode-display').textContent = '📚 ' + roomInfo.mode + ' • ' + roomInfo.game_mode;
+  const maxP = roomInfo.max_players || 6;
 
   const container = document.getElementById('lobby-players');
   container.innerHTML = '';
 
-  const slots = [{}, {}];
+  const slots = [];
+  for (let i = 0; i < maxP; i++) slots.push({});
   roomInfo.players.forEach((p, i) => { slots[i] = p; });
 
   slots.forEach((p, i) => {
     const div = document.createElement('div');
-    div.className = 'player-slot' + (p.name ? ' filled' : '');
+    const teamClass = p.team ? 'team-' + p.team : '';
+    div.className = 'player-slot ' + teamClass + (p.name ? ' filled' : '');
     if (p.name) {
       const initials = p.name.substr(0, 2).toUpperCase();
       const isMe = p.id === myPlayerId;
-      const hostBadge = p.is_host ? '<span style="background:#f39c12;color:#000;font-size:0.7rem;font-weight:800;padding:2px 8px;border-radius:10px;margin-left:6px;">HOST</span>' : '';
-      const meBadge = isMe ? '<span style="background:rgba(255,255,255,0.2);font-size:0.7rem;font-weight:800;padding:2px 8px;border-radius:10px;margin-left:6px;">KAMU</span>' : '';
+      const hostBadge = p.is_host ? '<span style="background:#f39c12;color:#000;font-size:0.65rem;font-weight:800;padding:2px 6px;border-radius:8px;margin-left:4px;">HOST</span>' : '';
+      const meBadge = isMe ? '<span style="background:rgba(255,255,255,0.2);font-size:0.65rem;font-weight:800;padding:2px 6px;border-radius:8px;margin-left:4px;">KAMU</span>' : '';
+      const teamBadge = p.team ? '<span style="font-size:0.65rem;font-weight:800;padding:2px 6px;border-radius:8px;margin-left:4px;background:' + TEAM_COLORS[p.team] + ';">' + (p.team === 'A' ? 'Alpha' : 'Bravo') + '</span>' : '';
       div.innerHTML = `
         <div class="player-avatar">${initials}</div>
         <div>
-          <div style="font-weight:800;font-size:1rem;">${p.name}${hostBadge}${meBadge}</div>
-          <div style="font-size:0.8rem;color:rgba(255,255,255,0.5);">Siap bermain</div>
+          <div style="font-weight:800;font-size:0.95rem;">${escapeHtml(p.name)}${hostBadge}${meBadge}${teamBadge}</div>
+          <div style="font-size:0.75rem;color:rgba(255,255,255,0.5);">Siap bermain</div>
         </div>`;
     } else {
       div.innerHTML = `
         <div class="player-avatar" style="background:rgba(255,255,255,0.1);">?</div>
-        <div style="color:rgba(255,255,255,0.4);font-weight:700;">Menunggu pemain ${i+1}...</div>`;
+        <div style="color:rgba(255,255,255,0.4);font-weight:700;font-size:0.9rem;">Menunggu pemain ${i+1}...</div>`;
     }
     container.appendChild(div);
   });
 
   const count = roomInfo.players.length;
-  container.previousElementSibling.textContent = `Pemain (${count}/2)`;
+  document.getElementById('lobby-player-count').textContent = `Pemain (${count}/${maxP})`;
 
   const startSection = document.getElementById('lobby-start-section');
   const waitingEl = document.getElementById('lobby-waiting');
@@ -1592,29 +1655,16 @@ function updateLobbyUI(roomInfo) {
   } else if (count >= 2 && !isHost) {
     waitingEl.innerHTML = '<div class="anim-pulse">✅ Menunggu host memulai permainan...</div>';
     startSection.style.display = 'none';
+    waitingEl.style.display = 'block';
   } else {
     startSection.style.display = 'none';
     waitingEl.style.display = 'block';
-    waitingEl.innerHTML = '<div class="anim-pulse">⏳ Menunggu pemain lain bergabung...</div>';
+    waitingEl.innerHTML = '<div class="anim-pulse">⏳ Menunggu pemain lain bergabug...</div>';
   }
-}
 
-// ═══════════════════════ SCOREBOARD ═══════════════════════
-function updateScoreboard(players, myId, prefix) {
-  prefix = prefix || '';
-  const myPl = players.find(p => p.id === myId);
-  const oppPl = players.find(p => p.id !== myId);
-  if (!myPl || !oppPl) return;
-
-  const n1 = prefix + 'p1-name', v1 = prefix + 'p1-val';
-  const n2 = prefix + 'p2-name', v2 = prefix + 'p2-val';
-
-  document.getElementById(n1).textContent = myPl.name;
-  document.getElementById(v1).textContent = myPl.score;
-  document.getElementById(n2).textContent = oppPl.name;
-  document.getElementById(v2).textContent = oppPl.score;
-
-  updateTopPoints(players);
+  // Store my team
+  const me = roomInfo.players.find(p => p.id === myPlayerId);
+  if (me) myTeam = me.team;
 }
 
 // ═══════════════════════ QUESTION ═══════════════════════
@@ -1630,6 +1680,8 @@ function renderQuestion(data, remainingTime) {
   document.getElementById('card-reveal').style.display = 'none';
   document.getElementById('opponent-answered-badge').style.display = 'none';
   document.getElementById('waiting-opponent').style.display = 'none';
+  document.getElementById('steal-result-section').style.display = 'none';
+  document.getElementById('player-finished-section').style.display = 'none';
 
   document.getElementById('q-number').textContent = `Soal ${data.current_q + 1}/${data.total_q}`;
   document.getElementById('q-text').textContent = data.question;
@@ -1648,7 +1700,7 @@ function renderQuestion(data, remainingTime) {
     btn.className = `btn-answer ${colors[i]} anim-popIn`;
     btn.style.animationDelay = (i * 0.08) + 's';
     btn.dataset.idx = i;
-    btn.innerHTML = `<span style="font-size:1.3rem;opacity:0.8;">${shapes[i]}</span><span style="flex:1;">${data.opts[i]}</span>`;
+    btn.innerHTML = `<span style="font-size:1.3rem;opacity:0.8;">${shapes[i]}</span><span style="flex:1;">${escapeHtml(data.opts[i])}</span>`;
     btn.onclick = () => submitAnswer(i);
     container.appendChild(btn);
   }
@@ -1678,8 +1730,13 @@ function submitAnswer(idx) {
     }
   });
 
-  document.getElementById('waiting-opponent').style.display = 'block';
   stopTimer();
+
+  if (currentGameMode === 'Steal') {
+    // In steal mode, don't show waiting - server will respond with result or card_pick
+  } else {
+    document.getElementById('waiting-opponent').style.display = 'block';
+  }
 
   socket.emit('submit_answer', {
     code: myRoomCode,
@@ -1693,6 +1750,7 @@ function showCardPick(cards) {
   cardPicked = false;
   document.getElementById('answer-buttons').style.display = 'none';
   document.getElementById('waiting-opponent').style.display = 'none';
+  document.getElementById('steal-result-section').style.display = 'none';
   document.getElementById('card-reveal').style.display = 'none';
 
   const section = document.getElementById('card-pick-section');
@@ -1700,6 +1758,7 @@ function showCardPick(cards) {
 
   const grid = document.getElementById('card-grid');
   grid.innerHTML = '';
+  grid.style.display = 'grid';
 
   cards.forEach((card, i) => {
     const div = document.createElement('div');
@@ -1725,71 +1784,60 @@ function pickCard(idx) {
     code: myRoomCode,
     card_idx: idx,
   });
-
-  // Reveal animation handled by card_revealed event
 }
 
-// ═══════════════════════ ROUND RESULT ═══════════════════════
+function showStealResult(correct, timedOut) {
+  document.getElementById('answer-buttons').style.display = 'none';
+  document.getElementById('card-pick-section').style.display = 'none';
+  const section = document.getElementById('steal-result-section');
+  section.style.display = 'block';
+
+  if (timedOut) {
+    document.getElementById('steal-result-icon').textContent = '⏰';
+    document.getElementById('steal-result-text').textContent = 'Waktu Habis!';
+    document.getElementById('steal-result-text').style.color = '#e74c3c';
+    document.getElementById('steal-result-detail').textContent = 'Tidak dapat kartu. Lanjut ke soal berikutnya...';
+    document.getElementById('steal-result-detail').style.color = '#e74c3c';
+  } else {
+    document.getElementById('steal-result-icon').textContent = '😔';
+    document.getElementById('steal-result-text').textContent = 'Salah!';
+    document.getElementById('steal-result-text').style.color = '#e74c3c';
+    document.getElementById('steal-result-detail').textContent = 'Tidak dapat kartu. Lanjut ke soal berikutnya...';
+    document.getElementById('steal-result-detail').style.color = '#e74c3c';
+  }
+}
+
+// ═══════════════════════ ROUND RESULT (Classic/Team) ═══════════════════════
 function showRoundResult(data) {
   showScreen('screen-result');
   stopTimer();
 
   const myPl = data.players.find(p => p.id === myPlayerId);
-  const oppPl = data.players.find(p => p.id !== myPlayerId);
 
-  if (myPl && oppPl) {
-    document.getElementById('res-p1-name').textContent = myPl.name;
-    document.getElementById('res-p1-val').textContent = myPl.score;
-    document.getElementById('res-p2-name').textContent = oppPl.name;
-    document.getElementById('res-p2-val').textContent = oppPl.score;
-    updateTopPoints(data.players);
-
-    const cardInfo = document.getElementById('result-card-info');
-    if (currentGameMode === 'Steal') {
-      if (myPl.was_correct && myPl.card_effect) {
-        document.getElementById('result-icon').textContent = myPl.card_icon || '🃏';
-        document.getElementById('result-text').textContent = 'Kartu Kamu: ' + (myPl.card_label || '');
-        document.getElementById('result-text').style.color = myPl.card_effect === 'minus' ? '#e74c3c' : (myPl.card_effect === 'plus' ? '#2ecc71' : '#f39c12');
-        document.getElementById('result-delta').textContent = myPl.card_effect === 'swap' ? 'Poin ditukar dengan lawan!' : (myPl.card_effect === 'plus' ? '+' + myPl.card_value + ' poin' : myPl.card_value + ' poin');
-        document.getElementById('result-delta').style.color = myPl.card_effect === 'minus' ? '#e74c3c' : '#2ecc71';
-        cardInfo.style.display = 'block';
-        cardInfo.textContent = '🃏 ' + (myPl.card_label || '');
-        cardInfo.style.color = myPl.card_effect === 'minus' ? '#e74c3c' : '#2ecc71';
-      } else if (!myPl.was_correct) {
-        document.getElementById('result-icon').textContent = '😔';
-        document.getElementById('result-text').textContent = 'Salah!';
-        document.getElementById('result-text').style.color = '#e74c3c';
-        document.getElementById('result-delta').textContent = 'Tidak dapat kartu';
-        document.getElementById('result-delta').style.color = '#e74c3c';
-        cardInfo.style.display = 'none';
-      }
+  if (myPl) {
+    if (myPl.delta > 0) {
+      document.getElementById('result-icon').textContent = '🎉';
+      document.getElementById('result-text').textContent = 'Benar!';
+      document.getElementById('result-text').style.color = '#2ecc71';
+      document.getElementById('result-delta').textContent = '+' + myPl.delta + ' poin';
+      document.getElementById('result-delta').style.color = '#2ecc71';
+    } else if (myPl.answer === -1) {
+      document.getElementById('result-icon').textContent = '⏰';
+      document.getElementById('result-text').textContent = 'Waktu Habis!';
+      document.getElementById('result-text').style.color = '#e74c3c';
+      document.getElementById('result-delta').textContent = myPl.delta + ' poin';
+      document.getElementById('result-delta').style.color = '#e74c3c';
     } else {
-      // Classic mode
-      cardInfo.style.display = 'none';
-      if (myPl.delta > 0) {
-        document.getElementById('result-icon').textContent = '🎉';
-        document.getElementById('result-text').textContent = 'Benar!';
-        document.getElementById('result-text').style.color = '#2ecc71';
-        document.getElementById('result-delta').textContent = '+' + myPl.delta + ' poin';
-        document.getElementById('result-delta').style.color = '#2ecc71';
-      } else if (myPl.answer === -1) {
-        document.getElementById('result-icon').textContent = '⏰';
-        document.getElementById('result-text').textContent = 'Waktu Habis!';
-        document.getElementById('result-text').style.color = '#e74c3c';
-        document.getElementById('result-delta').textContent = myPl.delta + ' poin';
-        document.getElementById('result-delta').style.color = '#e74c3c';
-      } else {
-        document.getElementById('result-icon').textContent = '😔';
-        document.getElementById('result-text').textContent = 'Salah!';
-        document.getElementById('result-text').style.color = '#e74c3c';
-        document.getElementById('result-delta').textContent = myPl.delta + ' poin';
-        document.getElementById('result-delta').style.color = '#e74c3c';
-      }
+      document.getElementById('result-icon').textContent = '😔';
+      document.getElementById('result-text').textContent = 'Salah!';
+      document.getElementById('result-text').style.color = '#e74c3c';
+      document.getElementById('result-delta').textContent = myPl.delta + ' poin';
+      document.getElementById('result-delta').style.color = '#e74c3c';
     }
   }
 
-  // Show answer options (Classic mode only)
-  if (currentGameMode === 'Classic' && data.opts) {
+  // Show answer options
+  if (data.opts) {
     const container = document.getElementById('result-answers');
     container.innerHTML = '';
     container.style.gridTemplateColumns = data.opts.length === 2 ? '1fr' : '1fr 1fr';
@@ -1803,7 +1851,7 @@ function showRoundResult(data) {
       const div = document.createElement('div');
       div.className = `btn-answer ${colors[i]}`;
       div.style.cursor = 'default';
-      div.innerHTML = `<span style="font-size:1.3rem;opacity:0.8;">${shapes[i]}</span><span style="flex:1;">${opt}</span>`;
+      div.innerHTML = `<span style="font-size:1.3rem;opacity:0.8;">${shapes[i]}</span><span style="flex:1;">${escapeHtml(opt)}</span>`;
 
       if (i === data.correct_idx) {
         div.classList.add('correct');
@@ -1828,20 +1876,32 @@ function showRoundResult(data) {
 }
 
 // ═══════════════════════ FINAL RESULT ═══════════════════════
-function showFinalResult(rankings) {
+function showFinalResult(data) {
   showScreen('screen-final');
   stopTimer();
 
+  const rankings = data.rankings || [];
+  const gameMode = data.game_mode || 'Classic';
   const me = rankings.find(p => p.id === myPlayerId);
   const myRank = rankings.findIndex(p => p.id === myPlayerId);
 
   let title, subtitle;
   if (rankings.length === 1) {
-    title = '🏆 MENANG!';
-    subtitle = 'Lawan telah keluar dari permainan';
+    title = '🏆 Selesai!';
+    subtitle = 'Permainan berakhir';
   } else if (rankings[0].score === rankings[1].score) {
     title = '🤝 SERI!';
     subtitle = 'Pertandingan berakhir imbang!';
+  } else if (gameMode === 'Team' && data.team_rankings) {
+    const myTeam = me ? me.team : null;
+    const winningTeam = data.team_rankings[0];
+    if (myTeam === winningTeam.team) {
+      title = '🏆 TIM KAMU MENANG!';
+      subtitle = winningTeam.name + ' memenangkan pertandingan!';
+    } else {
+      title = '😔 TIM KAMU KALAH';
+      subtitle = winningTeam.name + ' memenangkan pertandingan.';
+    }
   } else if (myRank === 0) {
     title = '🏆 MENANG!';
     subtitle = 'Kamu adalah pemenang!';
@@ -1853,23 +1913,47 @@ function showFinalResult(rankings) {
   document.getElementById('final-title').textContent = title;
   document.getElementById('final-subtitle').textContent = subtitle;
 
+  // Team rankings
+  const teamContainer = document.getElementById('final-team-rankings');
+  if (gameMode === 'Team' && data.team_rankings) {
+    teamContainer.style.display = 'block';
+    teamContainer.innerHTML = '';
+    data.team_rankings.forEach((t, i) => {
+      const isMyTeam = me && me.team === t.team;
+      const div = document.createElement('div');
+      div.className = 'card anim-slideUp';
+      div.style.cssText = `padding:16px 20px;margin-bottom:10px;border:2px solid ${TEAM_COLORS[t.team]};${isMyTeam ? 'box-shadow:0 0 20px ' + TEAM_COLORS[t.team] + '44;' : ''}`;
+      div.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <div style="font-size:1.2rem;font-weight:900;color:${TEAM_COLORS[t.team]};">${i === 0 ? '👑' : '🥈'} ${t.name}</div>
+            <div style="font-size:0.8rem;color:rgba(255,255,255,0.6);">${t.members.map(m => m.name).join(', ')}</div>
+          </div>
+          <div style="font-size:2rem;font-weight:900;color:${i === 0 ? '#f39c12' : 'rgba(255,255,255,0.7)'};">${t.score}</div>
+        </div>`;
+      teamContainer.appendChild(div);
+    });
+  } else {
+    teamContainer.style.display = 'none';
+  }
+
+  // Individual rankings
   const container = document.getElementById('final-rankings');
   container.innerHTML = '';
-  const medals = ['👑', '🥈'];
-  const rankNames = ['Juara 1', 'Peringkat 2'];
+  const medals = ['👑', '🥈', '🥉'];
 
   rankings.forEach((p, i) => {
     const isMe = p.id === myPlayerId;
     const div = document.createElement('div');
     div.className = 'card anim-slideUp';
-    div.style.cssText = `padding:20px;display:flex;align-items:center;gap:16px;animation-delay:${i*0.15}s;${isMe ? 'border:2px solid #f39c12;' : ''}`;
+    div.style.cssText = `padding:14px 20px;display:flex;align-items:center;gap:14px;animation-delay:${i*0.1}s;${isMe ? 'border:2px solid #f39c12;' : ''}`;
+    const teamTag = p.team ? ` <span style="font-size:0.7rem;background:${TEAM_COLORS[p.team]};padding:2px 8px;border-radius:8px;font-weight:800;">${p.team === 'A' ? 'Alpha' : 'Bravo'}</span>` : '';
     div.innerHTML = `
-      <div style="font-size:2.5rem;">${medals[i] || '🎖️'}</div>
+      <div style="font-size:2rem;">${medals[i] || '🎖️'}</div>
       <div style="flex:1;">
-        <div style="font-weight:800;font-size:1.1rem;">${p.name}${isMe ? ' <span style="font-size:0.75rem;background:#f39c12;color:#000;padding:2px 8px;border-radius:10px;font-weight:800;">KAMU</span>' : ''}</div>
-        <div style="font-size:0.85rem;color:rgba(255,255,255,0.6);font-weight:600;">${rankNames[i] || ''}</div>
+        <div style="font-weight:800;font-size:1rem;">${escapeHtml(p.name)}${isMe ? ' <span style="font-size:0.7rem;background:#f39c12;color:#000;padding:2px 8px;border-radius:8px;font-weight:800;">KAMU</span>' : ''}${teamTag}</div>
       </div>
-      <div style="font-size:2rem;font-weight:900;color:${i===0?'#f39c12':'rgba(255,255,255,0.7)'};">${p.score}</div>`;
+      <div style="font-size:1.6rem;font-weight:900;color:${i===0?'#f39c12':'rgba(255,255,255,0.7)'};">${p.score}</div>`;
     container.appendChild(div);
   });
 }
@@ -1959,7 +2043,7 @@ function addChatMessage(data) {
   const div = document.createElement('div');
   const isMe = data.id === myPlayerId;
   div.className = 'chat-bubble ' + (isMe ? 'me' : 'opp');
-  div.innerHTML = `<div class="chat-name">${data.name}</div>${escapeHtml(data.msg)}`;
+  div.innerHTML = `<div class="chat-name">${escapeHtml(data.name)}</div>${escapeHtml(data.msg)}`;
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
 
@@ -1994,12 +2078,7 @@ async function startVoice() {
     voiceActive = true;
     voiceMuted = false;
     updateVoiceButton();
-
-    // Notify the other peer to initiate connection
     socket.emit('voice_start', { code: myRoomCode });
-
-    // We'll create the peer connection when we receive voice_start from the other side
-    // or we can initiate immediately
     await createPeerConnection(true);
   } catch (err) {
     console.error('Voice error:', err);
@@ -2017,21 +2096,18 @@ async function createPeerConnection(isInitiator) {
 
   peerConnection = new RTCPeerConnection(rtcConfig);
 
-  // Add local tracks
   if (localStream) {
     localStream.getTracks().forEach(track => {
       peerConnection.addTrack(track, localStream);
     });
   }
 
-  // Handle remote tracks
   peerConnection.ontrack = (event) => {
     const audio = document.getElementById('remote-audio') || createRemoteAudio();
     audio.srcObject = event.streams[0];
     audio.play().catch(() => {});
   };
 
-  // Handle ICE candidates
   peerConnection.onicecandidate = (event) => {
     if (event.candidate) {
       socket.emit('voice_ice', { code: myRoomCode, candidate: event.candidate });
@@ -2123,6 +2199,10 @@ socket.on('session_restored', (data) => {
   localStorage.setItem('playerId', myPlayerId);
   localStorage.setItem('roomCode', myRoomCode);
 
+  if (data.room_info) {
+    updateScoreboardFromPlayers(data.room_info.players);
+  }
+
   const state = data.state;
   if (state === 'lobby') {
     showScreen('screen-lobby');
@@ -2131,17 +2211,18 @@ socket.on('session_restored', (data) => {
     const qd = data.question_data;
     currentGameMode = qd.game_mode || 'Classic';
     myCorrectIdx = qd.my_correct_idx !== undefined ? qd.my_correct_idx : null;
-    updateScoreboard(data.room_info.players, myPlayerId, 'score-');
     renderQuestion(qd, qd.remaining_time);
     if (qd.already_answered) {
       answeredThisRound = true;
-      document.getElementById('waiting-opponent').style.display = 'block';
+      if (currentGameMode !== 'Steal') {
+        document.getElementById('waiting-opponent').style.display = 'block';
+      }
       const btns = document.querySelectorAll('.btn-answer');
       btns.forEach(b => { b.disabled = true; b.style.opacity = '0.5'; });
       stopTimer();
     }
   } else if (state === 'finished' && data.rankings) {
-    showFinalResult(data.rankings);
+    showFinalResult({rankings: data.rankings, game_mode: (data.room_info || {}).game_mode || 'Classic'});
   }
 });
 
@@ -2184,7 +2265,7 @@ socket.on('new_question', (data) => {
 });
 
 socket.on('opponent_answered', () => {
-  if (!answeredThisRound) {
+  if (!answeredThisRound && currentGameMode !== 'Steal') {
     document.getElementById('opponent-answered-badge').style.display = 'block';
   }
 });
@@ -2207,27 +2288,34 @@ socket.on('card_revealed', (data) => {
   document.getElementById('card-reveal-icon').textContent = data.card.icon;
   document.getElementById('card-reveal-label').textContent = data.card.label;
   document.getElementById('card-reveal-label').style.color = data.card.type === 'minus' ? '#e74c3c' : (data.card.type === 'plus' ? '#2ecc71' : '#f39c12');
-  document.getElementById('waiting-opponent').style.display = 'block';
   document.getElementById('card-grid').style.display = 'none';
+});
+
+socket.on('steal_answer_result', (data) => {
+  showStealResult(data.correct, data.timed_out);
+});
+
+socket.on('score_update', (data) => {
+  updateScoreboardFromPlayers(data.players);
+});
+
+socket.on('player_finished', (data) => {
+  document.getElementById('answer-buttons').style.display = 'none';
+  document.getElementById('card-pick-section').style.display = 'none';
+  document.getElementById('steal-result-section').style.display = 'none';
+  document.getElementById('question-card').style.display = 'none';
+  document.getElementById('timer-bar').parentElement.style.display = 'none';
+  document.getElementById('player-finished-section').style.display = 'block';
 });
 
 socket.on('round_result', (data) => {
   stopTimer();
-  const players = data.players;
-  updateScoreboard(players, myPlayerId, 'score-');
-
-  if (currentGameMode === 'Classic') {
-    const myPl = players.find(p => p.id === myPlayerId);
-    const oppPl = players.find(p => p.id !== myPlayerId);
-    if (myPl) animateScoreDelta('score-p1-box', myPl.delta);
-    if (oppPl) animateScoreDelta('score-p2-box', oppPl.delta);
-  }
-
+  updateScoreboardFromPlayers(data.players);
   setTimeout(() => { showRoundResult(data); }, 400);
 });
 
 socket.on('game_over', (data) => {
-  showFinalResult(data.rankings);
+  showFinalResult(data);
   myRoomCode = null;
   localStorage.removeItem('roomCode');
 });
@@ -2244,14 +2332,21 @@ socket.on('opponent_disconnected', (data) => {
   data.remaining_players.forEach(p => {
     const div = document.createElement('div');
     div.style.textAlign = 'center';
-    div.innerHTML = `<div style="font-size:0.85rem;font-weight:700;opacity:0.7;">${p.name}</div><div style="font-size:2rem;font-weight:900;color:#2ecc71;">${p.score}</div>`;
+    div.innerHTML = `<div style="font-size:0.85rem;font-weight:700;opacity:0.7;">${escapeHtml(p.name)}</div><div style="font-size:2rem;font-weight:900;color:#2ecc71;">${p.score}</div>`;
     container.appendChild(div);
   });
 
   const disconnectedDiv = document.createElement('div');
   disconnectedDiv.style.textAlign = 'center';
-  disconnectedDiv.innerHTML = `<div style="font-size:0.85rem;font-weight:700;opacity:0.7;">${data.disconnected_name}</div><div style="font-size:2rem;font-weight:900;color:#e74c3c;">🚪</div>`;
+  disconnectedDiv.innerHTML = `<div style="font-size:0.85rem;font-weight:700;opacity:0.7;">${escapeHtml(data.disconnected_name)}</div><div style="font-size:2rem;font-weight:900;color:#e74c3c;">🚪</div>`;
   container.appendChild(disconnectedDiv);
+});
+
+socket.on('player_left', (data) => {
+  // In steal mode, a player left but game continues
+  if (data.remaining_players) {
+    updateScoreboardFromPlayers(data.remaining_players.map(p => ({...p, id: p.id})));
+  }
 });
 
 // Chat events
@@ -2259,7 +2354,6 @@ socket.on('chat_message', (data) => { addChatMessage(data); });
 
 // Voice signaling events
 socket.on('voice_start', (data) => {
-  // Other peer wants to start voice - we should also get mic and create connection
   if (!voiceActive) {
     startVoice().catch(() => {});
   }
