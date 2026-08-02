@@ -109,7 +109,10 @@ QUIZ_DATA = {
 }
 
 MODES = list(QUIZ_DATA.keys())
-GAME_MODES = ['Classic', 'Steal', 'Team']
+GAME_MODES = ['Classic', 'Steal']
+PLAY_MODES = ['Solo', 'Team']
+TEAM_SIZES = [1, 2, 3]
+TEAM_SIZE_LABELS = {1: '1v1', 2: '2v2', 3: '3v3'}
 TIMER_OPTIONS = [15, 30, 60]
 MAX_PLAYERS = 6
 TEAM_NAMES = ['Tim Alpha', 'Tim Bravo']
@@ -150,11 +153,13 @@ def room_summary(code, room):
         'code': code,
         'mode': room['mode'],
         'game_mode': room.get('game_mode', 'Classic'),
+        'play_mode': room.get('play_mode', 'Solo'),
+        'team_size': room.get('team_size', 1),
         'players': p_list,
         'state': room['state'],
         'current_q': room['current_q'],
         'total_q': len(room['questions']),
-        'max_players': MAX_PLAYERS,
+        'max_players': room.get('max_players', MAX_PLAYERS),
     }
 
 
@@ -206,9 +211,13 @@ def generate_card_deck():
 
 
 def assign_team(room, sid):
-    """Auto-assign team alternating A/B."""
-    count = len(room['players'])
-    return 'A' if count % 2 == 0 else 'B'
+    """Auto-assign team balancing A/B based on team_size."""
+    team_size = room.get('team_size', 1)
+    count_a = sum(1 for p in room['players'].values() if p.get('team') == 'A')
+    count_b = sum(1 for p in room['players'].values() if p.get('team') == 'B')
+    if count_a <= count_b and count_a < team_size:
+        return 'A'
+    return 'B'
 
 
 # ─── Classic / Team Mode ──────────────────────────────────────────────────────
@@ -497,9 +506,9 @@ def finish_game(code):
         key=lambda x: x['score'], reverse=True
     )
 
-    result = {'rankings': p_list, 'game_mode': game_mode}
+    result = {'rankings': p_list, 'game_mode': game_mode, 'play_mode': room.get('play_mode', 'Solo')}
 
-    if game_mode == 'Team':
+    if room.get('play_mode') == 'Team':
         teams = {}
         for p in p_list:
             t = p.get('team')
@@ -518,7 +527,7 @@ def finish_game(code):
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE, modes=MODES, game_modes=GAME_MODES, timer_options=TIMER_OPTIONS, max_players=MAX_PLAYERS)
+    return render_template_string(HTML_TEMPLATE, modes=MODES, game_modes=GAME_MODES, play_modes=PLAY_MODES, team_sizes=TEAM_SIZES, team_size_labels=TEAM_SIZE_LABELS, timer_options=TIMER_OPTIONS, max_players=MAX_PLAYERS)
 
 
 # ─── Socket.IO Handlers ───────────────────────────────────────────────────────
@@ -610,10 +619,23 @@ def on_restore_session(data):
                 'game_mode': game_mode,
             }
     elif state == 'finished':
-        restore_data['rankings'] = sorted(
+        p_sorted = sorted(
             [{'name': v['name'], 'score': v['score'], 'id': v['id'], 'team': v.get('team')} for v in room['players'].values()],
             key=lambda x: x['score'], reverse=True
         )
+        restore_data['rankings'] = p_sorted
+        restore_data['play_mode'] = room.get('play_mode', 'Solo')
+        if room.get('play_mode') == 'Team':
+            teams = {}
+            for p in p_sorted:
+                t = p.get('team')
+                if t:
+                    tn = TEAM_NAMES[0] if t == 'A' else TEAM_NAMES[1]
+                    if tn not in teams:
+                        teams[tn] = {'team': t, 'name': tn, 'score': 0, 'members': []}
+                    teams[tn]['score'] += p['score']
+                    teams[tn]['members'].append(p)
+            restore_data['team_rankings'] = sorted(teams.values(), key=lambda x: x['score'], reverse=True)
 
     emit('session_restored', restore_data)
 
@@ -623,6 +645,8 @@ def on_create_room(data):
     name = data.get('name', 'Player').strip() or 'Player'
     mode = data.get('mode', MODES[0])
     game_mode = data.get('game_mode', 'Classic')
+    play_mode = data.get('play_mode', 'Solo')
+    team_size = data.get('team_size', 1)
     timer_duration = data.get('timer_duration', 30)
     player_id = data.get('player_id', gen_code() + gen_code())
     sid = request.sid
@@ -631,8 +655,17 @@ def on_create_room(data):
         mode = MODES[0]
     if game_mode not in GAME_MODES:
         game_mode = 'Classic'
+    if play_mode not in PLAY_MODES:
+        play_mode = 'Solo'
+    if team_size not in TEAM_SIZES:
+        team_size = 1
     if timer_duration not in TIMER_OPTIONS:
         timer_duration = 30
+
+    if play_mode == 'Team':
+        max_players = team_size * 2
+    else:
+        max_players = MAX_PLAYERS
 
     code = gen_code()
     while code in rooms:
@@ -641,12 +674,15 @@ def on_create_room(data):
     questions = list(QUIZ_DATA[mode])
     random.shuffle(questions)
 
-    team = 'A' if game_mode == 'Team' else None
+    team = 'A' if play_mode == 'Team' else None
     rooms[code] = {
         'players': {sid: new_player(name, player_id, team)},
         'host': sid,
         'mode': mode,
         'game_mode': game_mode,
+        'play_mode': play_mode,
+        'team_size': team_size,
+        'max_players': max_players,
         'timer_duration': timer_duration,
         'questions': questions,
         'current_q': 0,
@@ -679,14 +715,14 @@ def on_join_room(data):
         return
 
     room = rooms[code]
-    if len(room['players']) >= MAX_PLAYERS:
-        emit('join_error', {'message': 'Room sudah penuh (maks 6 pemain)!'})
+    if len(room['players']) >= room.get('max_players', MAX_PLAYERS):
+        emit('join_error', {'message': 'Room sudah penuh!'})
         return
     if room['state'] != 'lobby':
         emit('join_error', {'message': 'Permainan sudah dimulai!'})
         return
 
-    team = assign_team(room, sid) if room.get('game_mode') == 'Team' else None
+    team = assign_team(room, sid) if room.get('play_mode') == 'Team' else None
     room['players'][sid] = new_player(name, player_id, team)
     player_sessions[player_id] = {'room_code': code, 'sid': sid}
     join_room(code)
@@ -712,7 +748,12 @@ def on_start_game(data):
     if room['host'] != sid:
         emit('error_msg', {'message': 'Hanya host yang bisa memulai!'})
         return
-    if len(room['players']) < 2:
+    if room.get('play_mode') == 'Team':
+        max_p = room.get('max_players', 6)
+        if len(room['players']) < max_p:
+            emit('error_msg', {'message': f'Team mode butuh {max_p} pemain (penuhi room dulu)!'})
+            return
+    elif len(room['players']) < 2:
         emit('error_msg', {'message': 'Butuh minimal 2 pemain untuk memulai!'})
         return
 
@@ -1224,9 +1265,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div id="game-mode-buttons" style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;">
         {% for gm in game_modes %}
         <button class="mode-btn {% if loop.first %}active{% endif %}" data-gm="{{ gm }}" onclick="selectGameMode('{{ gm }}')">
-          {% if gm == 'Classic' %}🎯 Classic{% elif gm == 'Steal' %}🃏 Steal{% else %}👥 Team{% endif %}
+          {% if gm == 'Classic' %}🎯 Classic{% elif gm == 'Steal' %}🃏 Steal{% endif %}
         </button>
         {% endfor %}
+      </div>
+
+      <div style="font-size:0.8rem;font-weight:700;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Mode Bermain</div>
+      <div id="play-mode-buttons" style="display:flex;gap:8px;margin-bottom:16px;">
+        <button class="mode-btn active" data-pm="Solo" onclick="selectPlayMode('Solo')">👤 Solo</button>
+        <button class="mode-btn" data-pm="Team" onclick="selectPlayMode('Team')">👥 Team</button>
+      </div>
+
+      <div id="team-size-section" style="display:none;margin-bottom:16px;">
+        <div style="font-size:0.8rem;font-weight:700;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Ukuran Tim</div>
+        <div id="team-size-buttons" style="display:flex;gap:8px;">
+          {% for ts in team_sizes %}
+          <button class="mode-btn {% if loop.first %}active{% endif %}" data-ts="{{ ts }}" onclick="selectTeamSize({{ ts }})">{{ team_size_labels[ts] }}</button>
+          {% endfor %}
+        </div>
       </div>
 
       <div style="font-size:0.8rem;font-weight:700;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Timer Per Soal</div>
@@ -1256,7 +1312,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div style="margin-top:16px;padding:12px;background:rgba(255,255,255,0.05);border-radius:12px;font-size:0.8rem;color:rgba(255,255,255,0.5);line-height:1.5;">
       <b style="color:#f39c12;">🎯 Classic:</b> Soal sama untuk semua, siapa cepat dia dapat.<br/>
       <b style="color:#9b59b6;">🃏 Steal:</b> Soal sendiri-sendiri, jawab benar = ambil kartu (2x -90, 2x +50, 1x swap). Tidak perlu nunggu lawan!<br/>
-      <b style="color:#2980b9;">👥 Team:</b> Dibagi 2 tim, skor digabung. Maks {{ max_players }} pemain!
+      <b style="color:#2980b9;">👤 Solo:</b> Setiap pemain untuk diri sendiri. Maks {{ max_players }} pemain.<br/>
+      <b style="color:#e67e22;">👥 Team:</b> Dibagi 2 tim (1v1, 2v2, 3v3), skor tim digabung!</b>
     </div>
   </div>
 </div>
@@ -1440,6 +1497,8 @@ let myAnswerThisRound = null;
 let gameState = 'menu';
 let answeredThisRound = false;
 let selectedGameMode = 'Classic';
+let selectedPlayMode = 'Solo';
+let selectedTeamSize = 1;
 let selectedTimer = 30;
 let myCorrectIdx = null;
 let currentGameMode = 'Classic';
@@ -1514,8 +1573,23 @@ function copyCode() {
 
 function selectGameMode(gm) {
   selectedGameMode = gm;
-  document.querySelectorAll('.mode-btn').forEach(b => {
+  document.querySelectorAll('#game-mode-buttons .mode-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.gm === gm);
+  });
+}
+
+function selectPlayMode(pm) {
+  selectedPlayMode = pm;
+  document.querySelectorAll('#play-mode-buttons .mode-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.pm === pm);
+  });
+  document.getElementById('team-size-section').style.display = (pm === 'Team') ? 'block' : 'none';
+}
+
+function selectTeamSize(ts) {
+  selectedTeamSize = ts;
+  document.querySelectorAll('#team-size-buttons .mode-btn').forEach(b => {
+    b.classList.toggle('active', parseInt(b.dataset.ts) === ts);
   });
 }
 
@@ -1610,9 +1684,14 @@ function updateScoreboardFromPlayers(players) {
 // ═══════════════════════ LOBBY ═══════════════════════
 function updateLobbyUI(roomInfo) {
   document.getElementById('lobby-code').textContent = roomInfo.code;
-  document.getElementById('lobby-mode-display').textContent = '📚 ' + roomInfo.mode + ' • ' + roomInfo.game_mode;
+  let modeText = '📚 ' + roomInfo.mode + ' • ' + roomInfo.game_mode;
+  if (roomInfo.play_mode === 'Team') {
+    modeText += ' • 👥 Team (' + (roomInfo.team_size || 1) + 'v' + (roomInfo.team_size || 1) + ')';
+  } else {
+    modeText += ' • 👤 Solo';
+  }
+  document.getElementById('lobby-mode-display').textContent = modeText;
   const maxP = roomInfo.max_players || 6;
-
   const container = document.getElementById('lobby-players');
   container.innerHTML = '';
 
@@ -1882,6 +1961,7 @@ function showFinalResult(data) {
 
   const rankings = data.rankings || [];
   const gameMode = data.game_mode || 'Classic';
+  const playMode = data.play_mode || 'Solo';
   const me = rankings.find(p => p.id === myPlayerId);
   const myRank = rankings.findIndex(p => p.id === myPlayerId);
 
@@ -1892,7 +1972,7 @@ function showFinalResult(data) {
   } else if (rankings[0].score === rankings[1].score) {
     title = '🤝 SERI!';
     subtitle = 'Pertandingan berakhir imbang!';
-  } else if (gameMode === 'Team' && data.team_rankings) {
+  } else if (playMode === 'Team' && data.team_rankings) {
     const myTeam = me ? me.team : null;
     const winningTeam = data.team_rankings[0];
     if (myTeam === winningTeam.team) {
@@ -1915,7 +1995,7 @@ function showFinalResult(data) {
 
   // Team rankings
   const teamContainer = document.getElementById('final-team-rankings');
-  if (gameMode === 'Team' && data.team_rankings) {
+  if (playMode === 'Team' && data.team_rankings) {
     teamContainer.style.display = 'block';
     teamContainer.innerHTML = '';
     data.team_rankings.forEach((t, i) => {
@@ -1968,6 +2048,8 @@ function createRoom() {
     name: name,
     mode: mode,
     game_mode: selectedGameMode,
+    play_mode: selectedPlayMode,
+    team_size: selectedTeamSize,
     timer_duration: selectedTimer,
     player_id: getOrCreatePlayerId(),
   });
@@ -2222,7 +2304,7 @@ socket.on('session_restored', (data) => {
       stopTimer();
     }
   } else if (state === 'finished' && data.rankings) {
-    showFinalResult({rankings: data.rankings, game_mode: (data.room_info || {}).game_mode || 'Classic'});
+    showFinalResult({rankings: data.rankings, game_mode: (data.room_info || {}).game_mode || 'Classic', play_mode: data.play_mode || 'Solo', team_rankings: data.team_rankings});
   }
 });
 
